@@ -236,9 +236,10 @@ def build_parser(preset: str | None = None) -> argparse.ArgumentParser:
     g = ap.add_argument_group("virtual gamepad")
     g.add_argument(
         "--gamepad",
-        choices=("off", "vigem"),
+        choices=("off", "vigem", "xgpad"),
         default="off",
-        help="feed the input to a virtual Xbox 360 pad on this PC, one per controller (vigem: Windows, ViGEmBus); "
+        help="feed the input to a virtual pad on this PC, one per controller (Windows; vigem: an Xbox 360 pad "
+        "through ViGEmBus, xgpad: an Xbox Series pad through the xgpad driver, run elevated); "
         "switches StartGame on so the game's rumble reaches the controller",
     )
     g.add_argument(

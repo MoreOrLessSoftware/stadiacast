@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `--gamepad xgpad`: each controller becomes an Xbox Series X|S controller through the xgpad
+  driver from the Sunshine fork, without ViGEmBus. Capture is the Share button, and the game's
+  rumble reaches the controller as with `vigem`. Needs the driver installed and an elevated
+  receiver.
+
 ### Fixed
 - `stadiacast-provision provision` failed on Windows with "The operation was canceled by the
   user": the controller's Wi-Fi scan drops the Bluetooth link. The controller's public key is

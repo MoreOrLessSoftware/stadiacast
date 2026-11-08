@@ -1,8 +1,10 @@
-"""A virtual Xbox 360 gamepad per controller, for the games on the receiver's PC (Windows, ViGEmBus).
+"""A virtual gamepad per controller, for the games on the receiver's PC (Windows).
 
-``--gamepad vigem`` creates one ViGEm pad per controller through ``vgamepad`` (the ``gamepad``
-extra, over the ViGEmBus driver), feeds every decoded input report to it as XInput fields, and
-forwards the game's rumble back to the controller through the game session, which the flag
+``--gamepad vigem`` creates one Xbox 360 pad per controller through ``vgamepad`` (the ``gamepad``
+extra, over the ViGEmBus driver); ``--gamepad xgpad`` creates one Xbox Series X|S pad through the
+xgpad driver instead (:mod:`stadiacast.xgpad`, no ViGEmBus, Capture becomes Share). Either way
+every decoded input report reaches the pad as XInput fields, and the receiver forwards the
+game's rumble back to the controller through the game session, which the flag
 switches on once the link is READY (rumble has no other path). The reports come from the
 display link and, once a game runs, from the game session; both read into the same
 :class:`~stadiacast.gamepad.GamepadState`. Two controllers are XInput players 1 and 2, each fed
@@ -22,7 +24,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
 from stadiacast.errors import SetupError
-from stadiacast.gamepad import XINPUT_LEFT_DEADZONE, XINPUT_RIGHT_DEADZONE, GamepadState
+from stadiacast.gamepad import XINPUT_LEFT_DEADZONE, XINPUT_RIGHT_DEADZONE, Button, GamepadState
 
 if TYPE_CHECKING:
     from stadiacast.config import Config
@@ -51,9 +53,16 @@ BUTTON_BITS: dict[int, str] = {
 #: XInput motor levels are 0..255; the controller's take 0..65535.
 MOTOR_SCALE = 257
 
+BACKENDS = ("vigem", "xgpad")
+
 
 class PadBackend(Protocol):
-    """What the receiver drives: one virtual pad."""
+    """What the receiver drives: one virtual pad.
+
+    ``apply`` gets XInput's ``XINPUT_GAMEPAD`` fields plus ``share`` (Stadia's Capture, which only
+    a pad with a Share button uses). ``on_rumble`` registers a callback the backend calls, from any
+    thread, with the game's motor levels already in the controller's 0..65535 range.
+    """
 
     slot: int | None
 
@@ -186,9 +195,12 @@ class ViGEmPad:
         self.mask = 0
 
     def on_rumble(self, callback: Callable[[int, int], None]) -> None:
-        # ViGEm calls back on its own thread with (client, target, large_motor, small_motor, led, user).
+        # ViGEm calls back on its own thread with (client, target, large_motor, small_motor, led, user),
+        # the motors in XInput's 0..255.
         self.pad.register_notification(
-            callback_function=lambda _c, _t, large, small, _led, _user: callback(int(large), int(small))
+            callback_function=lambda _c, _t, large, small, _led, _user: callback(
+                min(65535, int(large) * MOTOR_SCALE), min(65535, int(small) * MOTOR_SCALE)
+            )
         )
 
     def close(self) -> None:
@@ -228,8 +240,13 @@ class VirtualGamepads:
     @classmethod
     def create(cls, cfg: Config, log: Callable[..., Any], rx: Receiver) -> VirtualGamepads:
         """The backend ``--gamepad`` names, or a :class:`SetupError` saying what to install."""
-        if cfg.gamepad != "vigem":
-            raise ValueError(f"unknown --gamepad {cfg.gamepad!r}; use off or vigem")
+        if cfg.gamepad not in BACKENDS:
+            raise ValueError(f"unknown --gamepad {cfg.gamepad!r}; use off, {' or '.join(BACKENDS)}")
+        if cfg.gamepad == "xgpad":
+            from stadiacast.xgpad import XgpadPad, check_available
+
+            check_available()
+            return cls(cfg, log, rx, XgpadPad, kind="xgpad")
         if sys.platform != "win32":
             raise SetupError("--gamepad vigem is Windows only: it drives the ViGEmBus driver through vgamepad")
         try:
@@ -242,6 +259,11 @@ class VirtualGamepads:
                 "get it from https://github.com/nefarius/ViGEmBus/releases"
             ) from e
         return cls(cfg, log, rx, ViGEmPad)
+
+    def _fields(self, state: GamepadState) -> dict[str, int]:
+        fields = state.to_xinput(*self._dz)
+        fields["share"] = 1 if state.buttons & Button.CAPTURE else 0
+        return fields
 
     # ---- input -----------------------------------------------------------------------
     def on_event(self, ev: dict[str, Any]) -> None:
@@ -261,13 +283,13 @@ class VirtualGamepads:
             if label not in self._creating:
                 self._creating[label] = asyncio.get_running_loop().create_task(self._create(label))
             return
-        pad.apply(state.to_xinput(*self._dz))
+        pad.apply(self._fields(state))
         self._frames[label] = self._frames.get(label, 0) + 1
 
     async def _create(self, label: str) -> None:
         try:
             pad = await asyncio.to_thread(self._factory, label)
-        except Exception as e:  # ViGEm refused, or Windows never plugged the pad in: no pad until release()
+        except Exception as e:  # the driver refused, or Windows never plugged the pad in: no pad until release()
             error = str(e) if isinstance(e, SetupError) else repr(e)  # our own wording stays plain text
             self._failed[label] = error
             self.log("gamepad_failed", controller=label, error=error)
@@ -279,23 +301,22 @@ class VirtualGamepads:
         self._rumbles.setdefault(label, 0)
         loop = asyncio.get_running_loop()
 
-        def forward(large: int, small: int) -> None:  # from ViGEm's thread onto the loop
+        def forward(large: int, small: int) -> None:  # from the driver's thread onto the loop
             loop.call_soon_threadsafe(self._rumble, label, large, small)
 
         pad.on_rumble(forward)
         self.log("gamepad_created", controller=label, kind=self.kind, slot=pad.slot, deadzone=self.cfg.gamepad_deadzone)
         state = self._pending.pop(label, None)
         if state is not None:
-            pad.apply(state.to_xinput(*self._dz))
+            pad.apply(self._fields(state))
             self._frames[label] += 1
 
     # ---- rumble ----------------------------------------------------------------------
-    def _rumble(self, label: str, large: int, small: int) -> None:
-        """The game's motor levels, from ViGEm's thread via the loop: to the controller's game session."""
+    def _rumble(self, label: str, left: int, right: int) -> None:
+        """The game's motor levels (0..65535), from the driver's thread via the loop, to the game session."""
         ctl = self.rx.controllers.get(label)
         if ctl is None:
             return
-        left, right = min(65535, large * MOTOR_SCALE), min(65535, small * MOTOR_SCALE)
         self._rumbles[label] = self._rumbles.get(label, 0) + 1
         try:
             seq = ctl.game.set_rumble(left, right)
@@ -338,4 +359,12 @@ class VirtualGamepads:
         return out
 
 
-__all__ = ["BUTTON_BITS", "MOTOR_SCALE", "PadBackend", "ViGEmPad", "VirtualGamepads", "occupied_xinput_slots"]
+__all__ = [
+    "BACKENDS",
+    "BUTTON_BITS",
+    "MOTOR_SCALE",
+    "PadBackend",
+    "ViGEmPad",
+    "VirtualGamepads",
+    "occupied_xinput_slots",
+]

@@ -14,7 +14,7 @@ from stadiacast.gamepad import Button, GamepadState
 from stadiacast.input_protocol import InputDecoder
 from stadiacast.log import EventLog
 from stadiacast.protos import Protos
-from stadiacast.virtual_gamepad import BUTTON_BITS, MOTOR_SCALE, VirtualGamepads, wait_until_plugged_in
+from stadiacast.virtual_gamepad import BUTTON_BITS, MOTOR_SCALE, ViGEmPad, VirtualGamepads, wait_until_plugged_in
 from tests.fake_controller import FakeController
 from tests.helpers import connect_firmware_flow, fake, make_receiver, no_log, single, wait_for
 
@@ -87,6 +87,7 @@ def test_input_reaches_the_pad_and_rumble_comes_back(tmp_path) -> None:
             assert pad.label == "c0" and rx.log.counts["gamepad_created"] == 1
             x = pad.applied[-1]
             assert x["wButtons"] == 1 << 12 and x["bLeftTrigger"] == 255 and x["bRightTrigger"] == 0
+            assert x["share"] == 0
             assert x["sThumbLX"] > 0 and x["sThumbLY"] < 0  # past the deadzone, no sign flip
             assert fc.send_input_rpc(buttons=0, lx=1000, ly=1000)  # inside XInput's left deadzone
             await wait_for(lambda: len(pad.applied) >= 2)
@@ -97,9 +98,9 @@ def test_input_reaches_the_pad_and_rumble_comes_back(tmp_path) -> None:
             assert rx.status()["gamepads"] == {"c0": {"slot": 0, "frames": 2, "rumbles": 0}}
 
             assert pad.rumble_cb is not None
-            pad.rumble_cb(255, 128)  # the game's motors, as ViGEm reports them
+            pad.rumble_cb(65535, 32896)  # the game's motors, already in the controller's range
             await wait_for(lambda: rumbles)
-            assert rumbles == [(255 * MOTOR_SCALE, 128 * MOTOR_SCALE)] == [(65535, 32896)]
+            assert rumbles == [(65535, 32896)]
             assert rx.log.counts["gamepad_rumble"] == 1
 
             cs.reset_boot_state()  # a reboot lets go of everything
@@ -312,3 +313,62 @@ def test_the_first_report_waits_for_the_plug_in() -> None:
     expected = r"within 0 s \(Error: VIGEM_ERROR_TARGET_NOT_PLUGGED_IN\).*Windows Server"
     with pytest.raises(SetupError, match=expected):
         wait_until_plugged_in(never, timeout=0.0, sleep=naps.append)
+
+
+def test_capture_reaches_the_pad_as_share(tmp_path) -> None:
+    """XInput has no Capture; the pad fields carry it as ``share`` for a pad with a Share button (xgpad)."""
+
+    async def run() -> None:
+        rx = _with_fake_pads(make_receiver(tmp_path))
+        await rx.start()
+        fc = await connect_firmware_flow(rx)
+        try:
+            await asyncio.wait_for(fc.display_ready.wait(), 5)
+            await fc.keepalive()
+            assert fc.send_input_rpc(buttons=int(Button.CAPTURE))
+            await wait_for(lambda: _FakePad.created and _FakePad.created[0].applied)
+            x = _FakePad.created[0].applied[-1]
+            assert x["share"] == 1 and x["wButtons"] == 0
+        finally:
+            fc.close()
+            await rx.stop()
+
+    asyncio.run(run())
+
+
+def test_vigem_rumble_is_scaled_to_the_controller_range() -> None:
+    """ViGEm reports XInput's 0..255 motors; the backend hands the receiver 0..65535."""
+
+    class _Notifying:
+        def register_notification(self, callback_function) -> None:
+            self.cb = callback_function
+
+    pad = ViGEmPad.__new__(ViGEmPad)
+    pad.pad = _Notifying()
+    got: list[tuple[int, int]] = []
+    pad.on_rumble(lambda left, right: got.append((left, right)))
+    pad.pad.cb(None, None, 255, 128, 0, None)
+    assert got == [(255 * MOTOR_SCALE, 128 * MOTOR_SCALE)] == [(65535, 32896)]
+
+
+def test_the_xgpad_backend_parses_and_names_what_is_missing(monkeypatch) -> None:
+    from stadiacast import xgpad
+    from stadiacast.cli import parse_args
+
+    assert parse_args(["--gamepad", "xgpad"]).gamepad == "xgpad"
+    cfg = Config(cert="x", key="y", gamepad="xgpad")
+    log = EventLog(None, echo=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+    with pytest.raises(SetupError, match="Windows only"):
+        VirtualGamepads.create(cfg, log, None)  # type: ignore[arg-type]
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(xgpad, "driver_installed", lambda: False)
+    with pytest.raises(SetupError, match="xgpad driver installed"):
+        VirtualGamepads.create(cfg, log, None)  # type: ignore[arg-type]
+    monkeypatch.setattr(xgpad, "driver_installed", lambda: True)
+    monkeypatch.setattr(xgpad, "is_elevated", lambda: False)
+    with pytest.raises(SetupError, match="elevated"):
+        VirtualGamepads.create(cfg, log, None)  # type: ignore[arg-type]
+    monkeypatch.setattr(xgpad, "is_elevated", lambda: True)
+    pads = VirtualGamepads.create(cfg, log, None)  # type: ignore[arg-type]
+    assert pads.kind == "xgpad" and pads._factory is xgpad.XgpadPad

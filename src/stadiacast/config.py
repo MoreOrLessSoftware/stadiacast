@@ -80,7 +80,8 @@ class Config:
     audio_follow_volume: bool = True  # Windows: scale the loopback capture by the volume slider (False: before it)
 
     # -- virtual gamepad (the input as a pad on this PC) -----------------------------------
-    gamepad: str = "off"  # off | vigem: one virtual Xbox 360 pad per controller (Windows, ViGEmBus); implies StartGame
+    # off | vigem (Xbox 360 pad, ViGEmBus) | xgpad (Xbox Series pad, xgpad driver); Windows; implies StartGame
+    gamepad: str = "off"
     gamepad_deadzone: bool = True  # apply XInput's stick deadzones (False: raw sticks)
 
     # -- display link (post-DTLS RPCs) -----------------------------------------------------

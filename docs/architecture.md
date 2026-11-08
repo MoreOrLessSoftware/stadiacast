@@ -84,7 +84,9 @@ it publishes (`publish_event`), from the display link and the game session alike
 (`GamepadState.from_event` reads both shapes). It creates one pad per controller label in a
 worker thread, forwards the motor levels a game sets to that controller's `GameSession`, and
 lets go of the pad's state when the controller reboots, which is also when a pad that could not
-be created is tried again.
+be created is tried again. The pad itself is a `PadBackend`: `ViGEmPad` (`--gamepad vigem`,
+an Xbox 360 pad over ViGEmBus) or `XgpadPad` (`--gamepad xgpad`, an Xbox Series pad over the
+xgpad driver's shared memory, `xgpad.py`).
 
 **`RtcEndpoint`** is one UDP socket and one peer. It demultiplexes datagrams (STUN / DTLS /
 RTP), runs the connectivity checks and keepalives, drives the DTLS handshake through pyOpenSSL

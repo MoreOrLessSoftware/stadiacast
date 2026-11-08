@@ -201,6 +201,23 @@ and Capture have no XInput equivalent. The game's rumble comes back to the contr
 the game session, which `--gamepad` starts for that reason. Two controllers are players 1 and
 2, and `/_status` lists the pads under `gamepads`.
 
+### Xbox Series pad without ViGEmBus
+
+`--gamepad xgpad` makes each controller an Xbox Series X|S controller instead, through the
+xgpad driver from the [Sunshine fork](https://github.com/MoreOrLessSoftware/Sunshine)
+(`drivers/xgpad`): a user-mode HID driver that Windows' own `xinputhid` sits on, so XInput,
+Windows.Gaming.Input and GameInput all see a real Series pad. ViGEmBus is not needed, and the
+Capture button is the Series pad's Share button.
+
+```sh
+stadiacast --gamepad xgpad              # from an elevated prompt
+```
+
+Install the driver once, with the Sunshine installer's optional **Xbox Series Controller
+Driver** component or `drivers/xgpad/install-test.ps1` for a test build. The receiver has to
+run elevated, because creating a virtual device takes administrator rights. Without the driver
+or the rights, it stops at start-up with one line that says which is missing.
+
 ## Development
 
 ```sh
@@ -216,7 +233,7 @@ against a receiver in lab mode, and how to test against a real controller safely
 
 1. **First-boot autoconnect:** detect a controller in BLE setup mode and provision it onto the
    network automatically (today `stadiacast-provision` is the manual version).
-2. **Virtual gamepad on Linux and macOS:** Windows has one (`--gamepad vigem`); Linux (uinput)
+2. **Virtual gamepad on Linux and macOS:** Windows has two (`--gamepad vigem` or `xgpad`); Linux (uinput)
    and macOS are open.
 
 ## Security and privacy
