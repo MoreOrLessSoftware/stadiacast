@@ -45,6 +45,8 @@ except ImportError:  # the ble extra is optional: main() says so
 else:
     BLEAK_AVAILABLE = True
 
+LINK_ATTEMPTS = 3  # connections per provisioning run: the first, plus reconnects after a dropped link
+
 FAST_PAIR_SERVICE_DATA_UUID = "0000fe2c-0000-1000-8000-00805f9b34fb"
 STADIA_NAME_HINTS = ("stadia", "setup")
 
@@ -162,6 +164,20 @@ async def window_read(client: Any, pair: tuple[str, str], pages: int = 16) -> by
     return b"".join(chunks)
 
 
+async def read_scan_results(client: Any) -> list[dict[str, Any]]:
+    """The Wi-Fi scan results the controller holds (from its last scan)."""
+    raw = window_payload(await window_read(client, WINDOW_SCAN))
+    try:
+        results: list[dict[str, Any]] = json.loads(raw) if raw else []
+    except ValueError:
+        return []
+    return results
+
+
+def find_network(results: list[dict[str, Any]], ssid: str) -> dict[str, Any] | None:
+    return next((net for net in results if net.get("ssid") == ssid), None)
+
+
 async def trigger_scan_and_get_network(client: Any, ssid: str, timeout_s: float = 20.0) -> dict[str, Any]:
     """Trigger a Wi-Fi scan (settings characteristic) and return the target network's scan entry.
 
@@ -173,11 +189,11 @@ async def trigger_scan_and_get_network(client: Any, ssid: str, timeout_s: float 
         state = (await client.read_gatt_char(CHAR_STATE))[0]
         if state == STATE_SCAN_DONE:
             break
-    results: list[dict[str, Any]] = json.loads(window_payload(await window_read(client, WINDOW_SCAN)))
-    for net in results:
-        if net.get("ssid") == ssid:
-            return net
-    raise ProvisioningError(f"SSID {ssid!r} not found in scan results: {[n.get('ssid') for n in results]}")
+    results = await read_scan_results(client)
+    net = find_network(results, ssid)
+    if net is None:
+        raise ProvisioningError(f"SSID {ssid!r} not found in scan results: {[n.get('ssid') for n in results]}")
+    return net
 
 
 async def scan() -> None:
@@ -242,71 +258,129 @@ async def provision(
     service_data_match: str | None = None,
     wait: float = 45.0,
 ) -> None:
-    """Scan, encrypt the password with the device key and write the connect payload."""
+    """Encrypt the password with the device key, scan, and write the connect payload.
+
+    The controller's Wi-Fi scan can drop the BLE link (seen on Windows: the link goes as the scan
+    starts, or right after its results are read). So the public key is read before the scan, and
+    a dropped link is reconnected, up to ``LINK_ATTEMPTS`` times, to finish with the results the
+    controller already holds. The controller rotates its BLE address, so the reconnect finds it by
+    the Fast Pair service data it advertised the first time.
+    """
     print(f"Looking for {address} (up to 30s)...")
     wanted = service_data_match.lower() if service_data_match else None
+    seen: dict[str, bytes] = {}
 
     def match(d: Any, adv: Any) -> bool:
-        if d.address.lower() == address.lower():
-            return True
-        if wanted is None:
-            return False
         data = bytes((adv.service_data or {}).get(FAST_PAIR_SERVICE_DATA_UUID, b""))
-        return wanted in data.hex()
+        if d.address.lower() == address.lower() or (wanted is not None and wanted in data.hex()):
+            seen.setdefault("fast_pair", data)
+            return True
+        return False
 
     device = await BleakScanner.find_device_by_filter(match, timeout=30.0)
     if device is None:
         raise ProvisioningError("controller not advertising (pairing mode timed out?)")
-    print(f"Connecting to {device.address}...")
-    async with BleakClient(device, timeout=30.0) as client:
-        print(f"Connected to {device.address} (MTU {client.mtu_size})")
-        await client.start_notify(CHAR_STATE, on_state)
-        await client.start_notify(CHAR_OTA_STATUS, on_ota)
+    fast_pair = seen.get("fast_pair", b"")
 
-        # 1. scan and copy the device-reported security enums for the target
-        print(f"Scanning for {ssid!r}...")
-        net = await trigger_scan_and_get_network(client, ssid)
-        print(
-            f"Found: {net['ssid']} ({net['signal_level']} dBm, bssid {net['bssid']}, "
-            f"wpa_auth={net['wpa_auth']}, wpa_cipher={net['wpa_cipher']})"
-        )
+    def same_controller(d: Any, adv: Any) -> bool:
+        data = bytes((adv.service_data or {}).get(FAST_PAIR_SERVICE_DATA_UUID, b""))
+        if d.address.lower() == address.lower() or (wanted is not None and wanted in data.hex()):
+            return True
+        return bool(fast_pair and data == fast_pair)
 
-        # 2. fetch the device RSA public key and encrypt the password
-        enc = None
-        if password:
-            bundle = window_payload(await window_read(client, WINDOW_CRYPTO))
-            public_key = load_public_key(bundle)
-            print(f"Device RSA public key: {public_key.key_size} bits")
-            enc = encrypt_password(password, public_key)
-
-        payload = build_connect_payload(
-            ssid,
-            enc,
-            wpa_auth if wpa_auth is not None else net["wpa_auth"],
-            wpa_cipher if wpa_cipher is not None else net["wpa_cipher"],
-            bssid=net.get("bssid"),
-            frequency=net.get("frequency"),
-        )
-        message = json.dumps(payload, separators=(",", ":"))
-        print(f"-> {CHAR_CONNECT[:2]}: {redact(message)}")
-        data = message.encode()
-        max_write = client.mtu_size - 3  # ATT opcode + handle overhead
-        if len(data) > max_write:
-            raise ProvisioningError(
-                f"payload {len(data)}B exceeds ATT write capacity {max_write}B (MTU {client.mtu_size})"
-            )
-        await client.write_gatt_char(CHAR_CONNECT, data, response=True)
-        print("Sent. Watching state (0x3c = connected; the BLE link dropping after the write")
-        print("is also a success sign: the controller leaves setup mode once provisioned)...")
+    public_key: Any = None
+    net: dict[str, Any] | None = None
+    for attempt in range(LINK_ATTEMPTS):
+        if attempt:
+            print("The BLE link dropped (the controller's Wi-Fi scan can do that); reconnecting...")
+            await asyncio.sleep(1.0)
+            device = await BleakScanner.find_device_by_filter(same_controller, timeout=30.0)
+            if device is None:
+                raise ProvisioningError(
+                    "controller stopped advertising after the BLE link dropped; put it back in setup mode"
+                )
+        sent = done = False
         try:
-            await asyncio.sleep(wait)
-        finally:
-            try:
-                ip = await client.read_gatt_char(CHAR_IP)
-                if bytes(ip) != b"\x7f\x00\x00\x01":
-                    print(f"Controller IP: {'.'.join(str(b) for b in ip)}")
-            except Exception as e:  # the link usually drops once provisioning completes
-                print(f"(final read: {e}; link dropped, likely provisioning complete)")
+            print(f"Connecting to {device.address}...")
+            async with BleakClient(device, timeout=30.0) as client:
+                print(f"Connected to {device.address} (MTU {client.mtu_size})")
+                await client.start_notify(CHAR_STATE, on_state)
+                await client.start_notify(CHAR_OTA_STATUS, on_ota)
+
+                # 1. the device RSA public key, before the Wi-Fi scan can drop the link
+                if password and public_key is None:
+                    public_key = load_public_key(window_payload(await window_read(client, WINDOW_CRYPTO)))
+                    print(f"Device RSA public key: {public_key.key_size} bits")
+
+                # 2. scan and copy the device-reported security enums for the target
+                if net is None and attempt:
+                    net = find_network(await read_scan_results(client), ssid)  # what the dropped scan found
+                if net is None:
+                    print(f"Scanning for {ssid!r}...")
+                    net = await trigger_scan_and_get_network(client, ssid)
+                print(
+                    f"Found: {net['ssid']} ({net['signal_level']} dBm, bssid {net['bssid']}, "
+                    f"wpa_auth={net['wpa_auth']}, wpa_cipher={net['wpa_cipher']})"
+                )
+
+                enc = encrypt_password(password, public_key) if password else None
+                sent = True
+                await _send_credentials(client, ssid, net, enc, wpa_auth, wpa_cipher, wait)
+                done = True
+            return
+        except ProvisioningError:
+            raise
+        except Exception as e:  # bleak's errors, or WinRT's OSError for a cancelled GATT operation
+            if done:  # only the disconnect failed, after everything was sent
+                return
+            if sent:
+                raise ProvisioningError(
+                    f"the BLE link dropped while sending the credentials ({e}); the controller leaves setup mode"
+                    " once provisioned, so this often means it worked: wake it and watch the receiver's log"
+                ) from e
+            if attempt == LINK_ATTEMPTS - 1:
+                raise ProvisioningError(
+                    f"the BLE link kept dropping ({e}); move the controller closer and retry"
+                ) from e
+            print(f"    ({type(e).__name__}: {e})")
+
+
+async def _send_credentials(
+    client: Any,
+    ssid: str,
+    net: dict[str, Any],
+    enc: str | None,
+    wpa_auth: int | None,
+    wpa_cipher: int | None,
+    wait: float,
+) -> None:
+    """Write the connect payload and watch the state until ``wait`` runs out."""
+    payload = build_connect_payload(
+        ssid,
+        enc,
+        wpa_auth if wpa_auth is not None else net["wpa_auth"],
+        wpa_cipher if wpa_cipher is not None else net["wpa_cipher"],
+        bssid=net.get("bssid"),
+        frequency=net.get("frequency"),
+    )
+    message = json.dumps(payload, separators=(",", ":"))
+    print(f"-> {CHAR_CONNECT[:2]}: {redact(message)}")
+    data = message.encode()
+    max_write = client.mtu_size - 3  # ATT opcode + handle overhead
+    if len(data) > max_write:
+        raise ProvisioningError(f"payload {len(data)}B exceeds ATT write capacity {max_write}B (MTU {client.mtu_size})")
+    await client.write_gatt_char(CHAR_CONNECT, data, response=True)
+    print("Sent. Watching state (0x3c = connected; the BLE link dropping after the write")
+    print("is also a success sign: the controller leaves setup mode once provisioned)...")
+    try:
+        await asyncio.sleep(wait)
+    finally:
+        try:
+            ip = await client.read_gatt_char(CHAR_IP)
+            if bytes(ip) != b"\x7f\x00\x00\x01":
+                print(f"Controller IP: {'.'.join(str(b) for b in ip)}")
+        except Exception as e:  # the link usually drops once provisioning completes
+            print(f"(final read: {e}; link dropped, likely provisioning complete)")
 
 
 def build_parser() -> argparse.ArgumentParser:

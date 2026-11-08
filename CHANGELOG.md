@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- `stadiacast-provision provision` failed on Windows with "The operation was canceled by the
+  user": the controller's Wi-Fi scan drops the Bluetooth link. The controller's public key is
+  now read before the scan, and a dropped link is reconnected to finish with the scan results
+  the controller already holds, finding the controller by its Fast Pair data since its
+  Bluetooth address changes.
+
 ## [1.0.1] - 2026-11-07
 
 Fixes from the first run on a real Windows PC: the headset stream no longer pauses while the

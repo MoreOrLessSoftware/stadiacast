@@ -159,7 +159,8 @@ def test_provision_scans_copies_the_security_enums_and_writes_encrypted_credenti
     asyncio.run(ble.provision(FakeScanner.device.address, "hotspot", "hunter2", wait=0.01))
     (client,) = fake_ble.instances
     chars = [c for c, _ in client.writes]
-    assert chars[0] == ble.CHAR_SETTINGS  # the Wi-Fi rescan
+    assert chars[0] == ble.WINDOW_CRYPTO[1]  # the public key first: the Wi-Fi scan can drop the link
+    assert chars.index(ble.CHAR_SETTINGS) > 0  # then the Wi-Fi rescan
     assert chars[-1] == ble.CHAR_CONNECT
     payload = json.loads(client.writes[-1][1])
     assert payload["ssid"] == "hotspot"
@@ -184,6 +185,63 @@ def test_provision_matches_by_service_data_and_overrides(fake_ble):
     assert (payload["wpa_auth"], payload["wpa_cipher"]) == (1, 1)
     assert "enc_passwd" not in payload  # an open network: nothing to encrypt, no key read
     assert not any(c == ble.WINDOW_CRYPTO[1] for c, _ in client.writes)
+
+
+def test_a_link_dropped_by_the_wifi_scan_is_reconnected_under_a_rotated_address(fake_ble, monkeypatch, capsys):
+    """Seen on Windows: the controller's Wi-Fi scan drops the BLE link (WinRT cancels the next GATT
+    operation), and the controller comes back advertising under a new address. The provisioner finds
+    it by its Fast Pair data and finishes with the scan results the controller still holds."""
+    cancelled = OSError(-2147023673, "The operation was canceled by the user.")
+    first_read_after_scan: dict[str, bool] = {}
+
+    class DroppingClient(FakeClient):
+        async def read_gatt_char(self, char: str) -> bytearray:
+            scanned = self.state == ble.STATE_SCAN_DONE and len(FakeClient.instances) == 1
+            if scanned and char != ble.CHAR_STATE and not first_read_after_scan:
+                first_read_after_scan[char] = True
+                raise cancelled
+            return await super().read_gatt_char(char)
+
+    rotated = SimpleNamespace(address="AA:BB:CC:DD:EE:FF", name=None)
+    finds: list[Any] = []
+
+    async def find(match: Any, timeout: float = 0) -> Any:  # noqa: ARG001
+        device = FakeScanner.device if not finds else rotated  # a new address after the first find
+        finds.append(device)
+        return device if match(device, FakeScanner.advertisement) else None
+
+    monkeypatch.setattr(ble, "BleakClient", DroppingClient)
+    monkeypatch.setattr(FakeScanner, "find_device_by_filter", staticmethod(find))
+    asyncio.run(ble.provision(FakeScanner.device.address, "hotspot", "hunter2", wait=0.01))
+
+    first, second = fake_ble.instances
+    assert first.device is FakeScanner.device and second.device is rotated
+    assert ble.CHAR_CONNECT not in [c for c, _ in first.writes]
+    second_chars = [c for c, _ in second.writes]
+    assert ble.CHAR_SETTINGS not in second_chars  # the held scan results, no new scan
+    assert ble.WINDOW_CRYPTO[1] not in second_chars  # the key was read before the drop
+    payload = json.loads(second.writes[-1][1])
+    assert payload["ssid"] == "hotspot" and (payload["wpa_auth"], payload["wpa_cipher"]) == (5, 3)
+    assert PRIVATE_KEY.decrypt(base64.b64decode(payload["enc_passwd"]), padding.PKCS1v15()) == b"hunter2"
+    assert "reconnecting" in capsys.readouterr().out
+
+
+def test_a_link_that_keeps_dropping_is_a_clear_error(fake_ble, monkeypatch):
+    class AlwaysDropping(FakeClient):
+        async def write_gatt_char(self, char: str, data: bytes, response: bool = True) -> None:
+            if char == ble.CHAR_SETTINGS:
+                raise OSError(-2147023673, "The operation was canceled by the user.")
+            await super().write_gatt_char(char, data, response)
+
+        async def read_gatt_char(self, char: str) -> bytearray:
+            if char == ble.WINDOW_SCAN[0]:
+                return bytearray()  # nothing held: every attempt has to scan again
+            return await super().read_gatt_char(char)
+
+    monkeypatch.setattr(ble, "BleakClient", AlwaysDropping)
+    with pytest.raises(ble.ProvisioningError, match="kept dropping"):
+        asyncio.run(ble.provision(FakeScanner.device.address, "hotspot", "hunter2", wait=0.01))
+    assert len(fake_ble.instances) == ble.LINK_ATTEMPTS
 
 
 @pytest.mark.usefixtures("fake_ble")
