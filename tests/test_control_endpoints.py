@@ -207,3 +207,61 @@ def test_the_cli_stops_on_a_shutdown_request(tmp_path, monkeypatch):
         assert await asyncio.wait_for(task, 5) == 0
 
     asyncio.run(run())
+
+
+def test_events_push_the_input_document_on_every_change(tmp_path):
+    """``/_events`` is ``/_input`` as server-sent events: one right away, one per change, and the stream
+    ends when the receiver stops."""
+    import json
+    import time
+
+    from tests.helpers import connect_firmware_flow
+
+    async def next_event(reader):
+        lines = []
+        while True:
+            line = (await asyncio.wait_for(reader.readline(), 5)).decode()
+            if line in ("\n", "\r\n") and lines:
+                break
+            if line.strip():
+                lines.append(line.strip())
+        return lines
+
+    async def run():
+        rx = make_receiver(tmp_path)
+        await rx.start()
+        fc = await connect_firmware_flow(rx)
+        reader, writer = await asyncio.open_connection("127.0.0.1", rx.http.http_ports[0])
+        try:
+            await asyncio.wait_for(fc.display_ready.wait(), 5)
+            await fc.keepalive()
+            writer.write(b"GET /_events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            await writer.drain()
+            head = (await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)).decode()
+            assert head.startswith("HTTP/1.1 200") and "Content-Type: text/event-stream" in head
+            assert "Content-Length" not in head
+            assert await next_event(reader) == ["retry: 250"]
+
+            first = await next_event(reader)
+            assert first[0] == "event: input"
+            (entry,) = json.loads(first[1].removeprefix("data: "))["controllers"].values()
+            assert entry["ip"] == "127.0.0.1" and entry["input"] is None
+
+            sent = time.monotonic()
+            assert fc.send_input_rpc(buttons=1 << 12, lx=1234)
+            while True:  # pushed, not polled: well inside the 2 s heartbeat
+                event = await next_event(reader)
+                (entry,) = json.loads(event[1].removeprefix("data: "))["controllers"].values()
+                if entry["input"]:
+                    break
+            assert time.monotonic() - sent < 1.0
+            assert entry["input"]["held"] == ["a"] and entry["input"]["lx"] == 1234
+
+            await rx.stop()
+            assert await asyncio.wait_for(reader.read(), 5) == b""  # the stream ends with the receiver
+        finally:
+            writer.close()
+            fc.close()
+            await rx.stop()
+
+    asyncio.run(run())

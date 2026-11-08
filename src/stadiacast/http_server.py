@@ -15,7 +15,7 @@ import re
 import ssl
 import time
 import traceback
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
@@ -85,6 +85,9 @@ class HttpResponse:
     note: str | None = None  # free-text remark for the log (assumptions, fallbacks)
     extra_log: dict[str, Any] = field(default_factory=dict)  # merged into the http_request record
     close: bool = False  # close the connection after this response
+    # A body written as it is produced (server-sent events): no Content-Length, and the connection
+    # closes when the iterator ends or the client goes away.
+    stream: Callable[[], AsyncIterator[bytes]] | None = None
 
 
 Handler = Callable[[HttpRequest], Awaitable[HttpResponse]]
@@ -313,7 +316,7 @@ class HttpServer:
         await writer.drain()
 
     async def _write(self, writer: asyncio.StreamWriter, req: HttpRequest, resp: HttpResponse) -> None:
-        close = resp.close or req.wants_close()
+        close = resp.close or req.wants_close() or resp.stream is not None
         headers = [
             ("Date", email.utils.formatdate(self.clock(), usegmt=True)),
             ("Server", f"{SERVER_NAME}/{__version__}"),
@@ -321,9 +324,18 @@ class HttpServer:
         if resp.content_type:
             headers.append(("Content-Type", resp.content_type))
         headers += list(resp.headers)
-        headers.append(("Content-Length", str(len(resp.body))))
+        if resp.stream is None:
+            headers.append(("Content-Length", str(len(resp.body))))
         headers.append(("Connection", "close" if close else "keep-alive"))
         reason = HTTP_REASONS.get(resp.status, "OK")
         head = f"HTTP/1.1 {resp.status} {reason}\r\n" + "".join(f"{k}: {v}\r\n" for k, v in headers) + "\r\n"
         writer.write(head.encode("latin-1") + resp.body)
         await writer.drain()
+        if resp.stream is not None:
+            chunks = resp.stream()
+            try:
+                async for chunk in chunks:
+                    writer.write(chunk)
+                    await writer.drain()
+            finally:
+                await chunks.aclose()  # type: ignore[attr-defined]

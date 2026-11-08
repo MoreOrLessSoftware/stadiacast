@@ -776,6 +776,7 @@ class ControllerSession:
         if DISPLAY_STATES.index(state) > DISPLAY_STATES.index(d["state"]):
             d["state"] = state
             self.log("display_state", display_state=state, **info)
+            self.rx.notify_input()
             if state == "ready":
                 self._log_hardware_summary()
             if DISPLAY_STATES.index(state) >= DISPLAY_STATES.index("ready"):

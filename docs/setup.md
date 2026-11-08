@@ -48,7 +48,7 @@ Ports used by the receiver (all configurable):
 | 53 TCP/UDP | DNS | the DNS sink (`--dns-upstream` spawns it) |
 | 123 UDP | SNTP | time for the controller (`--sntp`, on in the `live` preset) |
 | 443 TCP | HTTPS | every Google endpoint the firmware talks to |
-| 80, 8008 TCP | HTTP | the local control endpoints `/_status`, `/_input`, `/_rumble`, `/_start_game`, `/_audio`, `/_shutdown` |
+| 80, 8008 TCP | HTTP | the local control endpoints `/_status`, `/_input`, `/_events`, `/_rumble`, `/_start_game`, `/_audio`, `/_shutdown` |
 | 40000 UDP | STUN/DTLS | the display link of the first controller (`c0`) |
 | 40001 UDP | STUN/DTLS | the game-streaming session of the first controller |
 | 40002, 40003 UDP, ... | STUN/DTLS | the same pair for the second controller (`c1`), and so on: base port + 2 per controller |
@@ -132,7 +132,9 @@ bulky log fields (request bodies, decoded protobufs) to the console too.
 `GET /_input` is the small version to poll several times a second, as the Sunshine plugin's
 live view does: per controller its display state, seconds since it was last heard from
 (`heard_s`; the display link's keepalives arrive every 1.5 s), battery, virtual pad, and the
-latest report (`input`: the held buttons by name, sticks and triggers). `POST /_shutdown`, from
+latest report (`input`: the held buttons by name, sticks and triggers), and its `ip`.
+`GET /_events` pushes the same document as server-sent events (`event: input`) instead: one
+right away, one per change, and at least one every 2 s. `POST /_shutdown`, from
 the receiver's own machine only, stops it like Ctrl-C does, helper processes and virtual pads
 included: the way to stop a receiver running in the background on Windows.
 

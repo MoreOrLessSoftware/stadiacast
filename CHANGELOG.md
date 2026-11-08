@@ -11,9 +11,9 @@ All notable changes to this project are documented here. The format follows
   driver from the Sunshine fork, without ViGEmBus. Capture is the Share button, and the game's
   rumble reaches the controller as with `vigem`. Needs the driver installed and an elevated
   receiver.
-- `GET /_input`: each controller's live state in one small document to poll: connection,
-  battery, virtual pad and the latest buttons, sticks and triggers. The Sunshine plugin's live
-  view reads it.
+- `GET /_input`: each controller's live state in one small document: connection, IP address,
+  battery, virtual pad and the latest buttons, sticks and triggers. `GET /_events` pushes it as
+  server-sent events on every change, which the Sunshine plugin's live view reads.
 - `POST /_shutdown` stops the receiver from its own machine, helpers and virtual pads included,
   for a receiver running in the background where Ctrl-C cannot reach it.
 

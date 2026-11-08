@@ -20,6 +20,7 @@ import os
 import re
 import time
 import traceback
+from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -85,6 +86,8 @@ class Receiver:
         self._helper_watchers: list[asyncio.Task[None]] = []
         self._inputs: dict[str, tuple[GamepadState, float]] = {}  # label -> latest gamepad report, when
         self.stop_requested = asyncio.Event()  # set by POST /_shutdown; the CLI waits on it
+        self._input_waiters: set[asyncio.Event] = set()  # one per /_events stream, set on every change
+        self._stopping = False
         self.started = False
 
     def now(self) -> float:
@@ -146,6 +149,8 @@ class Receiver:
         )
 
     async def stop(self) -> None:
+        self._stopping = True
+        self.notify_input()  # ends the /_events streams
         if self._stats_task:
             self._stats_task.cancel()
             self._stats_task = None
@@ -438,6 +443,15 @@ class Receiver:
             )
         if path == "/_input":
             return self._json(200, self.input_document(), handler="input")
+        if path == "/_events":
+            return HttpResponse(
+                200,
+                content_type="text/event-stream",
+                headers=[("Cache-Control", "no-store")],
+                handler="events",
+                close=True,
+                stream=self._input_events,
+            )
         if path == "/_shutdown":
             return self._shutdown(req)
         if path in ("/_start_game", "/_rumble"):
@@ -704,6 +718,7 @@ class Receiver:
         label = ev.get("controller")
         if label and "axes" in ev:  # gamepad reports, from either channel
             self._inputs[str(label)] = (GamepadState.from_event(ev), time.monotonic())
+            self.notify_input()
         if self.events is not None:
             self.events.put_nowait(ev)
         if self.gamepads is not None:
@@ -746,12 +761,41 @@ class Receiver:
     def forget_input(self, label: str) -> None:
         """The controller rebooted or went away: nothing it held is held any more."""
         self._inputs.pop(label, None)
+        self.notify_input()
+
+    def notify_input(self) -> None:
+        """Something ``/_input`` shows changed: wake every ``/_events`` stream."""
+        for waiter in self._input_waiters:
+            waiter.set()
+
+    async def _input_events(self, heartbeat: float = 2.0, min_gap: float = 1 / 60) -> AsyncIterator[bytes]:
+        """``GET /_events``: the ``/_input`` document as server-sent events, pushed on every change.
+
+        One ``input`` event right away, then one per change (a burst of reports is coalesced, at
+        most one event per ``min_gap``), and at least one every ``heartbeat`` seconds so the
+        timers in it stay fresh and a dead connection is noticed. ``retry`` asks a dropped client
+        to reconnect quickly. The stream ends when the receiver stops.
+        """
+        waiter = asyncio.Event()
+        self._input_waiters.add(waiter)
+        try:
+            yield b"retry: 250\n\n"
+            while not self._stopping:
+                waiter.clear()
+                yield b"event: input\ndata: " + json.dumps(self.input_document()).encode() + b"\n\n"
+                try:
+                    await asyncio.wait_for(waiter.wait(), heartbeat)
+                except TimeoutError:
+                    continue
+                await asyncio.sleep(min_gap)
+        finally:
+            self._input_waiters.discard(waiter)
 
     def input_document(self) -> dict[str, Any]:
         """The ``/_input`` document: per controller, what it is doing right now.
 
         Small enough to poll several times a second (the Sunshine plugin's live panel does):
-        ``display_state`` (``ready``/``input`` once the display link is up), ``heard_s`` (seconds
+        ``display_state`` (``ready``/``input`` once the display link is up), its ``ip``, ``heard_s`` (seconds
         since the last request or display-link message; keepalives arrive every 1.5 s),
         ``battery_percent``, the virtual ``gamepad`` (slot, or the error its creation ended in),
         and ``input``: the latest report, with the held buttons by name, or ``None`` before the first.
@@ -762,6 +806,7 @@ class Receiver:
         for ctl in self.controllers.values():
             entry: dict[str, Any] = {
                 "display_state": ctl.display_state,
+                "ip": ctl.ip,
                 "heard_s": round(now - ctl.last_heard, 1),
                 "battery_percent": ctl.session["display"]["battery_percent"],
                 "headset": ctl.session["display"]["headset"],
