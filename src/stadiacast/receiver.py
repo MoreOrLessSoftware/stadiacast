@@ -31,6 +31,7 @@ from stadiacast.certs import ensure_certificate, resolve_clock_pin
 from stadiacast.config import CLEARCUT_HOSTS, Config
 from stadiacast.controller import ControllerSession
 from stadiacast.errors import SetupError
+from stadiacast.gamepad import GamepadState
 from stadiacast.helpers import DNS_SINK, SNTP_SERVER, helper_command
 from stadiacast.http_server import HttpRequest, HttpResponse, HttpServer
 from stadiacast.log import EventLog
@@ -82,6 +83,8 @@ class Receiver:
         self._dns_proc: asyncio.subprocess.Process | None = None
         self._sntp_proc: asyncio.subprocess.Process | None = None
         self._helper_watchers: list[asyncio.Task[None]] = []
+        self._inputs: dict[str, tuple[GamepadState, float]] = {}  # label -> latest gamepad report, when
+        self.stop_requested = asyncio.Event()  # set by POST /_shutdown; the CLI waits on it
         self.started = False
 
     def now(self) -> float:
@@ -433,6 +436,10 @@ class Receiver:
             return HttpResponse(
                 200, json.dumps(self.status(), indent=1, default=str).encode(), "application/json", handler="status"
             )
+        if path == "/_input":
+            return self._json(200, self.input_document(), handler="input")
+        if path == "/_shutdown":
+            return self._shutdown(req)
         if path in ("/_start_game", "/_rumble"):
             return self._control(req)
         if path == "/_audio":
@@ -694,6 +701,9 @@ class Receiver:
     # ---- events and status ---------------------------------------------------------------
     def publish_event(self, ev: dict[str, Any]) -> None:
         """A decoded input event from one of the controllers (``ev["controller"]`` says which)."""
+        label = ev.get("controller")
+        if label and "axes" in ev:  # gamepad reports, from either channel
+            self._inputs[str(label)] = (GamepadState.from_event(ev), time.monotonic())
         if self.events is not None:
             self.events.put_nowait(ev)
         if self.gamepads is not None:
@@ -732,6 +742,63 @@ class Receiver:
                         )
         except asyncio.CancelledError:
             pass
+
+    def forget_input(self, label: str) -> None:
+        """The controller rebooted or went away: nothing it held is held any more."""
+        self._inputs.pop(label, None)
+
+    def input_document(self) -> dict[str, Any]:
+        """The ``/_input`` document: per controller, what it is doing right now.
+
+        Small enough to poll several times a second (the Sunshine plugin's live panel does):
+        ``display_state`` (``ready``/``input`` once the display link is up), ``heard_s`` (seconds
+        since the last request or display-link message; keepalives arrive every 1.5 s),
+        ``battery_percent``, the virtual ``gamepad`` (slot, or the error its creation ended in),
+        and ``input``: the latest report, with the held buttons by name, or ``None`` before the first.
+        """
+        now = time.monotonic()
+        pads = self.gamepads.status() if self.gamepads is not None else {}
+        controllers: dict[str, Any] = {}
+        for ctl in self.controllers.values():
+            entry: dict[str, Any] = {
+                "display_state": ctl.display_state,
+                "heard_s": round(now - ctl.last_heard, 1),
+                "battery_percent": ctl.session["display"]["battery_percent"],
+                "headset": ctl.session["display"]["headset"],
+                "gamepad": pads.get(ctl.label),
+                "input": None,
+            }
+            latest = self._inputs.get(ctl.label)
+            if latest is not None:
+                state, at = latest
+                entry["input"] = {
+                    "buttons": state.buttons,
+                    "held": state.held(),
+                    "lx": state.lx,
+                    "ly": state.ly,
+                    "rx": state.rx,
+                    "ry": state.ry,
+                    "l2": state.l2,
+                    "r2": state.r2,
+                    "age_s": round(now - at, 2),
+                }
+            controllers[ctl.label] = entry
+        return {"version": __version__, "gamepad": self.cfg.gamepad, "controllers": controllers}
+
+    def _shutdown(self, req: HttpRequest) -> HttpResponse:
+        """``POST /_shutdown``: stop the receiver as Ctrl-C would, helpers and virtual pads included.
+
+        Only from this machine: whoever runs the receiver in the background (the Sunshine plugin)
+        stops it this way, since a detached process on Windows gets no Ctrl-C.
+        """
+        if req.method != "POST":
+            return HttpResponse(405, b"", handler="shutdown")
+        peer = req.peer[0] if req.peer else ""
+        if peer not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            return self._json(403, {"error": "only from this machine"}, handler="shutdown")
+        self.log("shutdown_requested", peer=peer)
+        self.stop_requested.set()
+        return self._json(200, {"ok": True}, handler="shutdown")
 
     def status(self) -> dict[str, Any]:
         """The ``/_status`` document."""

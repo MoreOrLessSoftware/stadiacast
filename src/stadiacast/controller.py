@@ -100,7 +100,8 @@ class ControllerSession:
         self.device_id: str | None = None  # RegisterController / DiscoverDisplay body `device_id` (a UUID)
         self.serial: str | None = None  # the `controller-device-id` header (serial-like)
         self.display_token = f"{DISPLAY_TOKEN_PREFIX}-{slot}"
-        self.last_seen = time.monotonic()
+        self.last_seen = time.monotonic()  # the last HTTP request (boot, GMsg poll)
+        self.last_heard = self.last_seen  # the last HTTP request or display-link RPC (every 1.5 s when up)
         self.log = receiver.log.bind(controller=self.label)
         self.cert = DtlsCertificate()
         self.endpoint = RtcEndpoint(
@@ -165,7 +166,7 @@ class ControllerSession:
 
     def touch(self, ip: str | None, device_id: str | None = None, serial: str | None = None) -> None:
         """Note a sighting: the address it came from and any identifier it carried."""
-        self.last_seen = time.monotonic()
+        self.last_seen = self.last_heard = time.monotonic()
         if ip:
             self.ip = ip
         if device_id:
@@ -186,6 +187,7 @@ class ControllerSession:
         self._stop_audio()
         if self.rx.gamepads is not None:
             self.rx.gamepads.release(self.label)
+        self.rx.forget_input(self.label)
         self.game.close()
         self.endpoint.close()
 
@@ -215,6 +217,7 @@ class ControllerSession:
         self._stop_audio()
         if self.rx.gamepads is not None:
             self.rx.gamepads.release(self.label)
+        self.rx.forget_input(self.label)
         self.game.reset()
 
     def status(self) -> dict[str, Any]:
@@ -894,6 +897,7 @@ class ControllerSession:
         p = self.protos
         d = self.session["display"]
         d["rpc_in"] += 1
+        self.last_heard = time.monotonic()
         try:
             rpc = p.parse_rpc(data, p.ControllerToDisplay)
         except DecodeError as e:

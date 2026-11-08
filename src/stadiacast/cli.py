@@ -451,7 +451,11 @@ async def amain(cfg: Config) -> int:
         "wake the controller(s) now; Ctrl-C to stop.\n",
         flush=True,
     )
-    await stop.wait()
+    # Ctrl-C / SIGTERM, or POST /_shutdown from this machine (a receiver run in the background)
+    waits = [asyncio.ensure_future(stop.wait()), asyncio.ensure_future(receiver.stop_requested.wait())]
+    await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+    for w in waits:
+        w.cancel()
     await receiver.stop()
     return 0
 
