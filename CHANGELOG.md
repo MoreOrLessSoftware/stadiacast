@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-09
+
+An Xbox Series controller on Windows without ViGEmBus, a live view of each controller for the
+Sunshine plugin, and provisioning that gets through on Windows.
+
 ### Added
 - `--gamepad xgpad`: each controller becomes an Xbox Series X|S controller through the xgpad
   driver from the Sunshine fork, without ViGEmBus. Capture is the Share button, and the game's
@@ -104,7 +109,8 @@ confirmed against real controllers running the last Wi-Fi firmware, `ota.282115`
   security policy, code of conduct.
 - MIT License, with a `NOTICE` for the three protobuf schemas reproduced from the firmware.
 
-[Unreleased]: https://github.com/jkfran/stadiacast/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/MoreOrLessSoftware/stadiacast/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/MoreOrLessSoftware/stadiacast/releases/tag/v1.1.0
 [1.0.1]: https://github.com/jkfran/stadiacast/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jkfran/stadiacast/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/jkfran/stadiacast/releases/tag/v0.1.0
