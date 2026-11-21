@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-21
+
+The Xbox Series controller works with the xgpad driver in current Sunshine builds.
+
 ### Changed
 - `--gamepad xgpad` speaks the xgpad driver's shared memory v4 (Sunshine builds from 2026-11-18
   on): input and rumble go through rings of HID reports, and the pad passes its profile to the
@@ -115,7 +119,8 @@ confirmed against real controllers running the last Wi-Fi firmware, `ota.282115`
   security policy, code of conduct.
 - MIT License, with a `NOTICE` for the three protobuf schemas reproduced from the firmware.
 
-[Unreleased]: https://github.com/MoreOrLessSoftware/stadiacast/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/MoreOrLessSoftware/stadiacast/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/MoreOrLessSoftware/stadiacast/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/MoreOrLessSoftware/stadiacast/releases/tag/v1.1.0
 [1.0.1]: https://github.com/jkfran/stadiacast/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jkfran/stadiacast/compare/v0.1.0...v1.0.0
