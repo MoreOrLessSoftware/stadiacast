@@ -6,7 +6,8 @@ that the driver presents as an Xbox Series controller over Bluetooth LE (``045E:
 inbox ``xinputhid`` filter on top, so XInput, Windows.Gaming.Input and GameInput all see a real
 Series pad, Share button included. The receiver and the driver exchange HID reports through a
 named shared memory section and two events per pad; the contract is ``drivers/xgpad/xgpad_shared.h``
-(``XGPAD_SHARED_VERSION`` 3), mirrored here.
+(``XGPAD_SHARED_VERSION`` 4), mirrored here. Both directions are rings of generic HID reports
+(ID, length, payload); this backend only creates Xbox Series pads (profile 0).
 
 The report conversions at the top are pure Python so the tests check the mapping on every
 platform; :class:`XgpadPad` needs Windows, the driver package and an elevated receiver (creating
@@ -29,8 +30,13 @@ from stadiacast.errors import SetupError
 
 # ---- the shared contract (drivers/xgpad/xgpad_shared.h) ----------------------------------
 SHARED_MAGIC = 0x44415047  # 'GPAD'
-SHARED_VERSION = 3
+SHARED_VERSION = 4
 INPUT_RING_SIZE = 16
+OUTPUT_RING_SIZE = 16
+MAX_REPORT = 64  # largest report payload in bytes, report ID not included
+INPUT_REPORT_ID = 0x01
+OUTPUT_REPORT_ID = 0x03
+PROFILE_XBOX_SERIES = 0
 STATUS_DRIVER_STARTED = 0x1
 
 SECTION_NAME_FMT = "Global\\SunshineXgpad_{}"
@@ -38,6 +44,7 @@ INPUT_EVENT_NAME_FMT = "Global\\SunshineXgpad_{}_in"
 OUTPUT_EVENT_NAME_FMT = "Global\\SunshineXgpad_{}_out"
 TOKEN_MAX = 40  # characters, terminator included
 TOKEN_PROPKEY = (uuid.UUID("6c1f8d2e-3b7a-4e59-9a41-58d2c7e0b913"), 2)
+PROFILE_PROPKEY = (TOKEN_PROPKEY[0], 3)
 
 SWD_ENUMERATOR = "{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&02045e_PID&0b13_REV&0509"
 HARDWARE_ID = "SunshineXgpad\\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&02045e_PID&0b13"
@@ -154,6 +161,40 @@ def apply_output_report(report: bytes, previous: tuple[int, int]) -> tuple[tuple
     return (new_left, new_right), seconds
 
 
+def read_output_reports(shared: Shared, consumed: int) -> tuple[list[tuple[int, bytes]], int, int]:
+    """The output reports the driver published since ``consumed``, oldest first.
+
+    Returns ``(reports, consumed, lost)``: each report as ``(id, payload)``, the new consumed
+    count, and how many reports were skipped because the driver lapped the ring (a slot it
+    overwrote while it was being copied counts as lost too).
+    """
+    available = shared.outputCount
+    lost = 0
+    nxt = min(consumed, available)  # a smaller count means the section was reset
+    if available - nxt > OUTPUT_RING_SIZE:
+        lost += available - nxt - OUTPUT_RING_SIZE
+        nxt = available - OUTPUT_RING_SIZE
+    reports: list[tuple[int, bytes]] = []
+    while nxt < available:
+        n = nxt + 1
+        slot = shared.outputRing[(n - 1) % OUTPUT_RING_SIZE]
+        report_id, length = slot.id, min(slot.length, MAX_REPORT)
+        payload = bytes(slot.data[:length])
+        if shared.outputCount - n >= OUTPUT_RING_SIZE:
+            lost += 1  # torn: the driver reused the slot while it was copied
+        else:
+            reports.append((report_id, payload))
+        nxt = n
+    return reports, nxt, lost
+
+
+def xbox_output_payload(report_id: int, payload: bytes) -> bytes | None:
+    """The 8-byte rumble payload of an Xbox output report, or None for any other report."""
+    if report_id != OUTPUT_REPORT_ID or len(payload) < OUTPUT_REPORT.size:
+        return None
+    return payload[: OUTPUT_REPORT.size]
+
+
 def driver_installed() -> bool:
     """Whether an INF matching the xgpad hardware ID sits in the driver store (``%WINDIR%\\INF\\oem*.inf``)."""
     import os
@@ -192,14 +233,14 @@ def check_available() -> None:
 
 
 # ---- Windows plumbing (ctypes) ----------------------------------------------------------
-class _InputReport(ctypes.Structure):
+class Report(ctypes.Structure):
+    """``XGPAD_REPORT``: one ring entry (packed)."""
+
     _pack_ = 1
-    _fields_ = [("data", ctypes.c_ubyte * INPUT_REPORT.size)]
+    _fields_ = [("id", ctypes.c_uint8), ("length", ctypes.c_uint8), ("data", ctypes.c_ubyte * MAX_REPORT)]
 
 
-class _OutputReport(ctypes.Structure):
-    _pack_ = 1
-    _fields_ = [("data", ctypes.c_ubyte * OUTPUT_REPORT.size)]
+_LONG = ctypes.c_int32  # Windows LONG is 32-bit everywhere; ctypes.c_long is 64-bit on Linux and macOS
 
 
 class Shared(ctypes.Structure):
@@ -208,20 +249,23 @@ class Shared(ctypes.Structure):
     _fields_ = [
         ("magic", ctypes.c_uint32),
         ("version", ctypes.c_uint32),
-        ("inputCount", ctypes.c_long),
-        ("inputRing", _InputReport * INPUT_RING_SIZE),
+        ("profile", ctypes.c_uint32),
+        ("inputCount", _LONG),
+        ("inputRing", Report * INPUT_RING_SIZE),
         ("inputQpc", ctypes.c_int64),
-        ("outputSeq", ctypes.c_long),
-        ("output", _OutputReport),
+        ("outputCount", _LONG),
+        ("outputRing", Report * OUTPUT_RING_SIZE),
         ("outputQpc", ctypes.c_int64),
-        ("driverStatus", ctypes.c_long),
-        ("deliveredSeq", ctypes.c_long),
+        ("driverStatus", _LONG),
+        ("deliveredSeq", _LONG),
         ("deliveredQpc", ctypes.c_int64),
-        ("readsCompleted", ctypes.c_long),
-        ("outputsReceived", ctypes.c_long),
-        ("workerWakeups", ctypes.c_long),
-        ("readRequests", ctypes.c_long),
-        ("inputOverruns", ctypes.c_long),
+        ("readsCompleted", _LONG),
+        ("outputsReceived", _LONG),
+        ("workerWakeups", _LONG),
+        ("readRequests", _LONG),
+        ("inputOverruns", _LONG),
+        ("inputRejected", _LONG),
+        ("featureRequests", _LONG),
     ]
 
 
@@ -281,6 +325,7 @@ class _SecurityAttributes(ctypes.Structure):
 
 SW_CAPS = 0x1 | 0x2 | 0x8  # Removable | SilentInstall | DriverRequired
 DEVPROP_TYPE_STRING = 0x12
+DEVPROP_TYPE_UINT32 = 0x07
 WAIT_OBJECT_0, WAIT_TIMEOUT, INFINITE = 0, 0x102, 0xFFFFFFFF
 ERROR_ALREADY_EXISTS_HR = -2147024713  # HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS) = 0x800700B7
 FILE_MAP_ALL_ACCESS, PAGE_READWRITE = 0xF001F, 0x04
@@ -374,6 +419,7 @@ class XgpadPad:
         self._thread: threading.Thread | None = None
         self._callback: Callable[[int, int], None] | None = None
         self._rumble = (0, 0)
+        self._output_consumed = 0
         self._index = self._take_index()
         self.token = f"{self._index}_{uuid.uuid4().hex[:16]}"
         try:
@@ -438,6 +484,7 @@ class XgpadPad:
         ctypes.memset(view, 0, size)
         self.shared.magic = SHARED_MAGIC
         self.shared.version = SHARED_VERSION  # the driver starts from a neutral state on its own
+        self.shared.profile = PROFILE_XBOX_SERIES
 
     def _create_device(self) -> None:
         api = self._api
@@ -451,14 +498,20 @@ class XgpadPad:
         info.CapabilityFlags = SW_CAPS
         info.pszDeviceDescription = "Stadiacast Virtual Xbox Series Controller"
 
+        # The object name token and the profile, for the driver.
         token = ctypes.create_unicode_buffer(self.token)
-        guid, pid = TOKEN_PROPKEY
-        prop = _DevProperty()
-        prop.CompKey.Key = _DevPropKey(_Guid.from_uuid(guid), pid)
-        prop.CompKey.Store = 0  # DEVPROP_STORE_SYSTEM
-        prop.Type = DEVPROP_TYPE_STRING
-        prop.BufferSize = (len(self.token) + 1) * ctypes.sizeof(ctypes.c_wchar)
-        prop.Buffer = ctypes.cast(token, ctypes.c_void_p)
+        profile = ctypes.c_uint32(PROFILE_XBOX_SERIES)
+        props = (_DevProperty * 2)()
+        token_size = (len(self.token) + 1) * ctypes.sizeof(ctypes.c_wchar)
+        for prop, (guid, pid), kind, buffer, size in (
+            (props[0], TOKEN_PROPKEY, DEVPROP_TYPE_STRING, token, token_size),
+            (props[1], PROFILE_PROPKEY, DEVPROP_TYPE_UINT32, profile, ctypes.sizeof(profile)),
+        ):
+            prop.CompKey.Key = _DevPropKey(_Guid.from_uuid(guid), pid)
+            prop.CompKey.Store = 0  # DEVPROP_STORE_SYSTEM
+            prop.Type = kind
+            prop.BufferSize = size
+            prop.Buffer = ctypes.addressof(buffer)
 
         result = ERROR_ALREADY_EXISTS_HR
         for _ in range(20):  # a just-removed device with this instance ID may still be registered
@@ -467,8 +520,8 @@ class XgpadPad:
                 SWD_ENUMERATOR,
                 "HTREE\\ROOT\\0",
                 ctypes.byref(info),
-                1,
-                ctypes.byref(prop),
+                len(props),
+                props,
                 api.callback_stub,
                 None,
                 ctypes.byref(device),
@@ -506,8 +559,8 @@ class XgpadPad:
             if time.monotonic() >= deadline:
                 state = self._device_status()
                 hint = (
-                    "the installed driver probably does not speak shared memory"
-                    f" v{SHARED_VERSION}; reinstall it from a matching Sunshine build"
+                    "the installed driver probably speaks another shared memory version than"
+                    f" Stadiacast's v{SHARED_VERSION}; use Stadiacast and Sunshine builds made for the same version"
                     if state == "the device started"
                     else "check the device in Device Manager"
                 )
@@ -520,7 +573,10 @@ class XgpadPad:
     def _write(self, report: bytes) -> None:
         shared = self.shared
         count = shared.inputCount + 1  # single writer: this pad's caller
-        ctypes.memmove(ctypes.addressof(shared.inputRing[(count - 1) % INPUT_RING_SIZE]), report, len(report))
+        slot = shared.inputRing[(count - 1) % INPUT_RING_SIZE]
+        slot.id = INPUT_REPORT_ID
+        slot.length = len(report)
+        ctypes.memmove(ctypes.addressof(slot.data), report, len(report))
         qpc = ctypes.c_int64()
         self._api.QueryPerformanceCounter(ctypes.byref(qpc))
         shared.inputQpc = qpc.value
@@ -538,13 +594,17 @@ class XgpadPad:
     def on_rumble(self, callback: Callable[[int, int], None]) -> None:
         self._callback = callback
 
-    def _read_output(self) -> bytes:
-        shared = self.shared
-        while True:
-            seq = shared.outputSeq
-            data = bytes(shared.output.data)
-            if not seq & 1 and seq == shared.outputSeq:
-                return data
+    def _apply_output(self) -> tuple[tuple[int, int], float] | None:
+        """Every new Xbox output report, in order -> the resulting motor levels and the last one's duration."""
+        reports, self._output_consumed, _lost = read_output_reports(self.shared, self._output_consumed)
+        result: tuple[tuple[int, int], float] | None = None
+        levels = self._rumble
+        for report_id, payload in reports:
+            rumble = xbox_output_payload(report_id, payload)
+            if rumble is not None:
+                result = apply_output_report(rumble, levels)
+                levels = result[0]
+        return result
 
     def _emit(self, levels: tuple[int, int]) -> None:
         self._rumble = levels
@@ -558,7 +618,10 @@ class XgpadPad:
             timeout = INFINITE if stop_at is None else max(0, int((stop_at - time.monotonic()) * 1000))
             wait = self._api.WaitForMultipleObjects(2, handles, False, timeout)
             if wait == WAIT_OBJECT_0:
-                levels, seconds = apply_output_report(self._read_output(), self._rumble)
+                applied = self._apply_output()
+                if applied is None:
+                    continue  # nothing new for the grips (another report ID, or a spurious wake-up)
+                levels, seconds = applied
                 stop_at = time.monotonic() + seconds if seconds else None
                 if levels != self._rumble:
                     self._emit(levels)
@@ -593,6 +656,7 @@ class XgpadPad:
 
 __all__ = [
     "XINPUT_TO_XGPAD",
+    "Report",
     "Shared",
     "XgpadPad",
     "apply_output_report",
@@ -601,4 +665,6 @@ __all__ = [
     "hat_from_buttons",
     "input_report",
     "motor_level",
+    "read_output_reports",
+    "xbox_output_payload",
 ]

@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- `--gamepad xgpad` speaks the xgpad driver's shared memory v4 (Sunshine builds from 2026-11-18
+  on): input and rumble go through rings of HID reports, and the pad passes its profile to the
+  driver. Drivers from older Sunshine builds (v3) no longer attach; the error now says the two
+  sides speak different versions.
+
 ## [1.1.0] - 2026-11-09
 
 An Xbox Series controller on Windows without ViGEmBus, a live view of each controller for the
